@@ -774,6 +774,7 @@ class AnimationTrackEditor : public VBoxContainer {
 	void _move_selection_begin();
 	void _move_selection(float p_offset);
 	void _move_selection_commit();
+	void _set_selection_time(float p_time);
 	void _move_selection_cancel();
 
 	AnimationTrackKeyEdit *key_edit = nullptr;

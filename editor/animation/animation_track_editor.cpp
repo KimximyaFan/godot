@@ -752,6 +752,28 @@ void AnimationMultiTrackKeyEdit::_key_ofs_changed(const Ref<Animation> &p_anim, 
 }
 
 bool AnimationMultiTrackKeyEdit::_set(const StringName &p_name, const Variant &p_value) {
+	String property_name = p_name;
+
+	if (property_name == "time") {
+		real_t new_time = p_value;
+
+		if (use_fps) {
+			real_t step = animation->get_step();
+			if (step > 0) {
+				new_time *= step;
+			}
+		}
+
+		new_time = CLAMP(new_time, (real_t)0.0, animation->get_length());
+
+		if (editor) {
+			editor->call_deferred(SNAME("_set_selection_time"), new_time);
+			return true;
+		}
+
+		return false;
+	}
+
 	bool update_obj = false;
 	bool change_notify_deserved = false;
 	for (const KeyValue<int, List<float>> &E : key_ofs_map) {
@@ -1011,6 +1033,28 @@ bool AnimationMultiTrackKeyEdit::_set(const StringName &p_name, const Variant &p
 }
 
 bool AnimationMultiTrackKeyEdit::_get(const StringName &p_name, Variant &r_ret) const {
+	String property_name = p_name;
+
+	if (property_name == "time") {
+		for (const KeyValue<int, List<float>> &E : key_ofs_map) {
+			for (const float &key_ofs : E.value) {
+				real_t display_time = key_ofs;
+
+				if (use_fps) {
+					real_t step = animation->get_step();
+					if (step > 0) {
+						display_time /= step;
+					}
+				}
+
+				r_ret = display_time;
+				return true;
+			}
+		}
+
+		return false;
+	}
+
 	for (const KeyValue<int, List<float>> &E : key_ofs_map) {
 		int track = E.key;
 		for (const float &key_ofs : E.value) {
@@ -1133,6 +1177,22 @@ void AnimationMultiTrackKeyEdit::_get_property_list(List<PropertyInfo> *p_list) 
 	if (animation.is_null()) {
 		return;
 	}
+
+	real_t max_time = animation->get_length();
+	String time_hint;
+
+	if (use_fps && animation->get_step() > 0) {
+		max_time /= animation->get_step();
+		time_hint = vformat("0,%.0f,1", max_time);
+	} else {
+		time_hint = vformat("0,%.4f,0.0001", max_time);
+	}
+
+	p_list->push_back(PropertyInfo(
+			Variant::FLOAT,
+			"time",
+			PROPERTY_HINT_RANGE,
+			time_hint));
 
 	int first_track = -1;
 	float first_key = -1.0;
@@ -6342,6 +6402,215 @@ void AnimationTrackEditor::_select_at_anim(const Ref<Animation> &p_anim, int p_t
 	marker_edit->_clear_selection(marker_edit->is_selection_active());
 }
 
+void AnimationTrackEditor::_set_selection_time(float p_time) {
+	if (animation.is_null() || selection.is_empty()) {
+		return;
+	}
+
+	p_time = CLAMP(p_time, 0.0f, (float)animation->get_length());
+
+	// A track cannot contain multiple selected keys at exactly
+	// the same destination time.
+	RBMap<int, bool> seen_tracks;
+	bool changed = false;
+
+	for (const KeyValue<SelectedKey, KeyInfo> &E : selection) {
+		const int track = E.key.track;
+
+		if (seen_tracks.has(track)) {
+			EditorNode::get_singleton()->show_warning(
+					TTR("Cannot set multiple selected keys from the same track to the same time."));
+			return;
+		}
+
+		seen_tracks[track] = true;
+
+		if (!Math::is_equal_approx(E.value.pos, p_time)) {
+			changed = true;
+		}
+	}
+
+	if (!changed) {
+		return;
+	}
+
+	EditorUndoRedoManager *undo_redo =
+			EditorUndoRedoManager::get_singleton();
+
+	undo_redo->create_action(
+			TTR("Animation Set Keys Time"));
+
+	List<_AnimMoveRestore> to_restore;
+
+	// 1. Remove selected keys.
+	for (RBMap<SelectedKey, KeyInfo>::Element *E = selection.back();
+			E;
+			E = E->prev()) {
+		undo_redo->add_do_method(
+				animation.ptr(),
+				"track_remove_key",
+				E->key().track,
+				E->key().key);
+	}
+
+	// 2. Remove unselected keys already at the destination.
+	for (RBMap<SelectedKey, KeyInfo>::Element *E = selection.back();
+			E;
+			E = E->prev()) {
+		int idx = animation->track_find_key(
+				E->key().track,
+				p_time,
+				Animation::FIND_MODE_APPROX);
+
+		if (idx == -1) {
+			continue;
+		}
+
+		SelectedKey sk;
+		sk.key = idx;
+		sk.track = E->key().track;
+
+		if (selection.has(sk)) {
+			continue;
+		}
+
+		_AnimMoveRestore restore;
+
+		restore.key =
+				animation->track_get_key_value(
+						E->key().track,
+						idx);
+
+		restore.track = E->key().track;
+
+		restore.time =
+				animation->track_get_key_time(
+						E->key().track,
+						idx);
+
+		restore.transition =
+				animation->track_get_key_transition(
+						E->key().track,
+						idx);
+
+		to_restore.push_back(restore);
+
+		undo_redo->add_do_method(
+				animation.ptr(),
+				"track_remove_key_at_time",
+				E->key().track,
+				restore.time);
+	}
+
+	// 3. Insert every selected key at p_time.
+	for (RBMap<SelectedKey, KeyInfo>::Element *E = selection.back();
+			E;
+			E = E->prev()) {
+		undo_redo->add_do_method(
+				animation.ptr(),
+				"track_insert_key",
+				E->key().track,
+				p_time,
+				animation->track_get_key_value(
+						E->key().track,
+						E->key().key),
+				animation->track_get_key_transition(
+						E->key().track,
+						E->key().key));
+	}
+
+	// 4. Undo: remove moved keys.
+	for (RBMap<SelectedKey, KeyInfo>::Element *E = selection.back();
+			E;
+			E = E->prev()) {
+		undo_redo->add_undo_method(
+				animation.ptr(),
+				"track_remove_key_at_time",
+				E->key().track,
+				p_time);
+	}
+
+	// 5. Undo: put selected keys back at their original times.
+	for (RBMap<SelectedKey, KeyInfo>::Element *E = selection.back();
+			E;
+			E = E->prev()) {
+		undo_redo->add_undo_method(
+				animation.ptr(),
+				"track_insert_key",
+				E->key().track,
+				E->get().pos,
+				animation->track_get_key_value(
+						E->key().track,
+						E->key().key),
+				animation->track_get_key_transition(
+						E->key().track,
+						E->key().key));
+	}
+
+	// 6. Undo: restore keys that originally occupied p_time.
+	for (_AnimMoveRestore &restore : to_restore) {
+		undo_redo->add_undo_method(
+				animation.ptr(),
+				"track_insert_key",
+				restore.track,
+				restore.time,
+				restore.key,
+				restore.transition);
+	}
+
+	// 7. Rebuild selection.
+	undo_redo->add_do_method(
+			this,
+			"_clear_selection_for_anim",
+			animation);
+
+	undo_redo->add_undo_method(
+			this,
+			"_clear_selection_for_anim",
+			animation);
+
+	for (RBMap<SelectedKey, KeyInfo>::Element *E = selection.back();
+			E;
+			E = E->prev()) {
+		undo_redo->add_do_method(
+				this,
+				"_select_at_anim",
+				animation,
+				E->key().track,
+				p_time);
+
+		undo_redo->add_undo_method(
+				this,
+				"_select_at_anim",
+				animation,
+				E->key().track,
+				E->get().pos);
+	}
+
+	undo_redo->add_do_method(
+			this,
+			"_redraw_tracks");
+
+	undo_redo->add_undo_method(
+			this,
+			"_redraw_tracks");
+
+	AnimationPlayerEditor *ape =
+			AnimationPlayerEditor::get_singleton();
+
+	if (ape) {
+		undo_redo->add_do_method(
+				ape,
+				"_animation_update_key_frame");
+
+		undo_redo->add_undo_method(
+				ape,
+				"_animation_update_key_frame");
+	}
+
+	undo_redo->commit_action();
+}
+
 void AnimationTrackEditor::_move_selection_commit() {
 	EditorUndoRedoManager *undo_redo = EditorUndoRedoManager::get_singleton();
 	undo_redo->create_action(TTR("Animation Move Keys"));
@@ -8052,6 +8321,7 @@ void AnimationTrackEditor::_bind_methods() {
 	ClassDB::bind_method("_clear_selection_for_anim", &AnimationTrackEditor::_clear_selection_for_anim);
 	ClassDB::bind_method("_select_at_anim", &AnimationTrackEditor::_select_at_anim);
 	ClassDB::bind_method("_clear_selection", &AnimationTrackEditor::_clear_selection);
+	ClassDB::bind_method("_set_selection_time", &AnimationTrackEditor::_set_selection_time);
 
 	ClassDB::bind_method(D_METHOD("_bezier_track_set_key_handle_mode", "animation", "track_idx", "key_idx", "key_handle_mode", "key_handle_set_mode"), &AnimationTrackEditor::_bezier_track_set_key_handle_mode, DEFVAL(Animation::HANDLE_SET_MODE_NONE));
 	ClassDB::bind_method(D_METHOD("_bezier_track_set_key_handle_mode_at_time", "animation", "track_idx", "time", "key_handle_mode", "key_handle_set_mode"), &AnimationTrackEditor::_bezier_track_set_key_handle_mode_at_time, DEFVAL(Animation::HANDLE_SET_MODE_NONE));
